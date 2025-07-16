@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import json
 import logging
@@ -6,7 +7,9 @@ from typing import List, Dict, Any, Optional, Union
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
-import os
+import time
+import random
+from dotenv import load_dotenv
 import re
 from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
@@ -15,12 +18,34 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 from tqdm import tqdm
-import time
-import random
+import hashlib
+from database.rag_database import RAGDatabase
+
+# Load environment variables
+load_dotenv()
+
+# Create logs directory
+logs_dir = Path("fitness_app/logs")
+logs_dir.mkdir(parents=True, exist_ok=True)
+
+# Create cache directory
+cache_dir = Path("fitness_app/cache")
+cache_dir.mkdir(parents=True, exist_ok=True)
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(logs_dir / 'data_collection.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 class FitnessDataCollector:
-    def __init__(self, output_dir: str = "data"):
-        self.data_dir = Path(output_dir)
+    def __init__(self, output_dir: str = "data", collect_types: Optional[List[str]] = None, force_refresh: bool = False):
+        self.data_dir = Path("fitness_app/data")
         self.data_dir.mkdir(parents=True, exist_ok=True)
         
         self.categories = {
@@ -65,20 +90,76 @@ class FitnessDataCollector:
         
         # Create category-specific directories
         for category in self.categories.keys():
-            (self.data_dir / category).mkdir(exist_ok=True)
+            (self.data_dir / category).mkdir(parents=True, exist_ok=True)
         
-        # Setup logging with rotation
-        log_path = self.data_dir / 'data_collection.log'
-        # Clear existing log file
-        if log_path.exists():
-            log_path.unlink()
+        self.collect_types = collect_types or ['injuries', 'recovery']
+        self.force_refresh = force_refresh
+        
+        # Initialize counters
+        self.stats = {
+            'injuries': {'total': 0, 'sources': {}},
+            'recovery': {'total': 0, 'sources': {}}
+        }
+        
+        # Load cache
+        self.cache = self._load_cache()
+        
+        logger.info(f"Initialized data collector for types: {', '.join(self.collect_types)}")
+        logger.info(f"Data will be saved to: {self.data_dir}")
+        logger.info(f"Logs will be saved to: {logs_dir}")
+        logger.info(f"Cache will be stored in: {cache_dir}")
+        if self.force_refresh:
+            logger.info("Force refresh enabled - will ignore cache")
+    
+    def _load_cache(self) -> Dict:
+        """Load the cache of previously successful collections"""
+        cache_file = cache_dir / "collection_cache.json"
+        if cache_file.exists():
+            try:
+                with open(cache_file, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"Error loading cache: {str(e)}")
+        return {}
+
+    def _save_cache(self):
+        """Save the cache of successful collections"""
+        cache_file = cache_dir / "collection_cache.json"
+        try:
+            with open(cache_file, 'w') as f:
+                json.dump(self.cache, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving cache: {str(e)}")
+
+    def _get_cache_key(self, source: str, category: str) -> str:
+        """Generate a cache key for a source and category"""
+        return f"{source}_{category}"
+
+    def _is_cached(self, source: str, category: str) -> bool:
+        """Check if a source is cached and still valid"""
+        if self.force_refresh:
+            return False
             
-        logging.basicConfig(
-            filename=str(log_path),
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            force=True  # Force reconfiguration of the root logger
-        )
+        cache_key = self._get_cache_key(source, category)
+        if cache_key in self.cache:
+            # Only consider successful collections as cached
+            if not self.cache[cache_key].get("success", False):
+                return False
+                
+            # Check if cache is less than 24 hours old
+            cache_time = datetime.fromisoformat(self.cache[cache_key]["timestamp"])
+            if (datetime.now() - cache_time).total_seconds() < 86400:  # 24 hours
+                return True
+        return False
+
+    def _update_cache(self, source: str, category: str, success: bool):
+        """Update the cache with collection result"""
+        cache_key = self._get_cache_key(source, category)
+        self.cache[cache_key] = {
+            "timestamp": datetime.now().isoformat(),
+            "success": success
+        }
+        self._save_cache()
     
     def preprocess_text(self, text: str) -> str:
         """Clean and normalize text content"""
@@ -201,65 +282,7 @@ class FitnessDataCollector:
     def _parse_sources(self, llm_response: str) -> List[Dict]:
         """Parse LLM response into structured source information"""
         return [
-            # Exercise Sources (Public APIs)
-            {
-                "name": "ExerciseDB API",
-                "url": "https://api.exercisedb.io/v1/exercises",
-                "type": "api",
-                "access_method": "api",
-                "data_format": "json",
-                "category": "exercises",
-                "reliability": "high",
-                "description": "Public exercise database API",
-                "verification": "public_api",
-                "headers": {
-                    "X-RapidAPI-Key": "YOUR_API_KEY",
-                    "X-RapidAPI-Host": "exercisedb.p.rapidapi.com"
-                }
-            },
-            {
-                "name": "WGER Exercise API",
-                "url": "https://wger.de/api/v2/exercise/",
-                "type": "api",
-                "access_method": "api",
-                "data_format": "json",
-                "category": "exercises",
-                "reliability": "high",
-                "description": "Open source exercise database API",
-                "verification": "public_api"
-            },
-            # Nutrition Sources (Public APIs)
-            {
-                "name": "USDA Food Database API",
-                "url": "https://api.nal.usda.gov/fdc/v1/foods/search",
-                "type": "api",
-                "access_method": "api",
-                "data_format": "json",
-                "category": "nutrition",
-                "reliability": "high",
-                "description": "Official USDA food database API",
-                "verification": "government_api",
-                "params": {
-                    "api_key": "YOUR_API_KEY",
-                    "pageSize": 100
-                }
-            },
-            {
-                "name": "Nutritionix API",
-                "url": "https://trackapi.nutritionix.com/v2/natural/nutrients",
-                "type": "api",
-                "access_method": "api",
-                "data_format": "json",
-                "category": "nutrition",
-                "reliability": "high",
-                "description": "Nutrition database API",
-                "verification": "public_api",
-                "headers": {
-                    "x-app-id": "YOUR_APP_ID",
-                    "x-app-key": "YOUR_API_KEY"
-                }
-            },
-            # Injury Sources (Public APIs)
+            # OpenFDA API for injury reports and treatments
             {
                 "name": "OpenFDA API",
                 "url": "https://api.fda.gov/drug/event.json",
@@ -268,52 +291,44 @@ class FitnessDataCollector:
                 "data_format": "json",
                 "category": "injuries",
                 "reliability": "high",
-                "description": "FDA adverse event reports API",
+                "description": "FDA adverse event reports and medical device reports",
                 "verification": "government_api",
                 "params": {
-                    "api_key": "YOUR_API_KEY",
-                    "limit": 100
+                    "api_key": os.getenv("OPENFDA_API_KEY"),
+                    "limit": 100,
+                    "search": "patient.reaction.reactionmeddrapt"
                 }
             },
-            # Academic Sources (Public APIs)
+            # WHO Injury Database (Public, no API key needed)
+            {
+                "name": "WHO Injury Database",
+                "url": "https://www.who.int/data/gho/data/themes/topics/injuries",
+                "type": "api",
+                "access_method": "api",
+                "data_format": "json",
+                "category": "injuries",
+                "reliability": "high",
+                "description": "WHO global injury statistics and prevention data",
+                "verification": "government_api"
+            },
+            # PubMed API (Free, no API key needed)
             {
                 "name": "PubMed API",
                 "url": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/",
                 "type": "api",
                 "access_method": "api",
                 "data_format": "json",
-                "category": "fitness_knowledge",
+                "category": "injuries",
                 "reliability": "high",
-                "description": "PubMed research database API",
+                "description": "PubMed research papers on injuries and recovery",
                 "verification": "academic_api",
                 "params": {
-                    "api_key": "YOUR_API_KEY",
                     "db": "pubmed",
-                    "retmode": "json"
+                    "retmode": "json",
+                    "retmax": 100,
+                    "tool": "fitness_app",
+                    "email": "your.email@example.com"  # Required for PubMed
                 }
-            },
-            # Open Data Sources
-            {
-                "name": "Kaggle Fitness Dataset",
-                "url": "https://www.kaggle.com/datasets/fmendes/fitness-exercises-with-animations",
-                "type": "dataset",
-                "access_method": "direct_download",
-                "data_format": "csv",
-                "category": "exercises",
-                "reliability": "high",
-                "description": "Fitness exercises dataset with animations",
-                "verification": "curated_dataset"
-            },
-            {
-                "name": "UCI Fitness Dataset",
-                "url": "https://archive.ics.uci.edu/ml/datasets/Fitness+Exercises",
-                "type": "dataset",
-                "access_method": "direct_download",
-                "data_format": "csv",
-                "category": "exercises",
-                "reliability": "high",
-                "description": "UCI fitness exercises dataset",
-                "verification": "academic_dataset"
             }
         ]
     
@@ -1374,19 +1389,602 @@ class FitnessDataCollector:
         except Exception as e:
             logging.error(f"Error processing downloaded file from {source['name']}: {str(e)}")
 
+    def collect_data(self):
+        """Main method to collect all data"""
+        logger.info("Starting data collection...")
+        logger.info(f"Collecting types: {', '.join(self.collect_types)}")
+        
+        if 'injuries' in self.collect_types:
+            self._collect_injury_data()
+        
+        if 'recovery' in self.collect_types:
+            self._collect_recovery_data()
+        
+        self.log_collection_summary()  # Changed from _log_collection_stats to log_collection_summary
+    
+    def _collect_injury_data(self):
+        """Collect injury data from various sources"""
+        logger.info("\n=== Collecting Injury Data ===")
+        
+        # OpenFDA
+        if not self._is_cached("OpenFDA", "injuries"):
+            logger.info("\nCollecting from OpenFDA API...")
+            openfda_data = self._collect_openfda_data()
+            if openfda_data and len(openfda_data.get('data', [])) > 0:
+                self._save_data('injuries', 'openfda', openfda_data)
+                self.stats['injuries']['sources']['OpenFDA'] = len(openfda_data['data'])
+                self.stats['injuries']['total'] += len(openfda_data['data'])
+                self._update_cache("OpenFDA", "injuries", True)
+            else:
+                self._update_cache("OpenFDA", "injuries", False)
+        else:
+            logger.info("\nSkipping OpenFDA API (cached)")
+        
+        # WHO
+        if not self._is_cached("WHO", "injuries"):
+            logger.info("\nCollecting from WHO Injury Database...")
+            who_data = self._collect_who_data()
+            if who_data and len(who_data.get('data', [])) > 0:
+                self._save_data('injuries', 'who', who_data)
+                self.stats['injuries']['sources']['WHO'] = len(who_data['data'])
+                self.stats['injuries']['total'] += len(who_data['data'])
+                self._update_cache("WHO", "injuries", True)
+            else:
+                self._update_cache("WHO", "injuries", False)
+        else:
+            logger.info("\nSkipping WHO Injury Database (cached)")
+        
+        # PubMed
+        if not self._is_cached("PubMed", "injuries"):
+            logger.info("\nCollecting from PubMed API...")
+            pubmed_data = self._collect_pubmed_data()
+            if pubmed_data and len(pubmed_data.get('data', [])) > 0:
+                self._save_data('injuries', 'pubmed', pubmed_data)
+                self.stats['injuries']['sources']['PubMed'] = len(pubmed_data['data'])
+                self.stats['injuries']['total'] += len(pubmed_data['data'])
+                self._update_cache("PubMed", "injuries", True)
+            else:
+                self._update_cache("PubMed", "injuries", False)
+        else:
+            logger.info("\nSkipping PubMed API (cached)")
+    
+    def _collect_recovery_data(self):
+        """Collect recovery and rehabilitation data"""
+        logger.info("\n=== Collecting Recovery Data ===")
+        
+        # PubMed Recovery
+        if not self._is_cached("PubMed", "recovery"):
+            logger.info("\nCollecting recovery protocols from PubMed...")
+            recovery_data = self._collect_pubmed_recovery_data()
+            if recovery_data and len(recovery_data.get('data', [])) > 0:
+                self._save_data('recovery', 'pubmed_recovery', recovery_data)
+                self.stats['recovery']['sources']['PubMed'] = len(recovery_data['data'])
+                self.stats['recovery']['total'] += len(recovery_data['data'])
+                self._update_cache("PubMed", "recovery", True)
+            else:
+                self._update_cache("PubMed", "recovery", False)
+        else:
+            logger.info("\nSkipping PubMed Recovery (cached)")
+
+    def _process_for_rag(self, data: Dict, source: str, category: str):
+        """Process collected data for RAG system"""
+        try:
+            # Initialize RAG database
+            rag_db = RAGDatabase()
+            
+            # Process each item
+            for item in data.get('data', []):
+                try:
+                    # Create structured data
+                    structured_data = {
+                        "title": item.get("title", ""),
+                        "content": item.get("content", ""),
+                        "source": source,
+                        "category": category,
+                        "type": item.get("type", "general"),
+                        "metadata": {
+                            "authors": item.get("metadata", {}).get("authors", []),
+                            "journal": item.get("metadata", {}).get("journal", ""),
+                            "date": item.get("metadata", {}).get("report_date", datetime.now().isoformat()),
+                            "reliability": item.get("reliability", "medium")
+                        }
+                    }
+                    
+                    # Add to RAG database
+                    rag_db.process_and_store_data([structured_data], source=source)
+                    
+                except Exception as item_e:
+                    logger.error(f"Error processing item for RAG: {str(item_e)}")
+                    continue
+                
+            logger.info(f"Successfully processed {len(data.get('data', []))} items from {source} for RAG system")
+            
+        except Exception as e:
+            logger.error(f"Error processing data for RAG system: {str(e)}")
+
+    def _save_data(self, category: str, source: str, data: Dict):
+        """Save collected data to JSON file and process for RAG"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{source}_{timestamp}.json"
+        filepath = self.data_dir / category / filename
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        
+        logger.info(f"Saved {len(data['data'])} items to {filepath}")
+        
+        # Process for RAG system
+        self._process_for_rag(data, source, category)
+
+    def _collect_who_data(self) -> Dict:
+        """Collect injury data from WHO GHO OData API"""
+        try:
+            # Base URL for WHO GHO OData API
+            base_url = "https://ghoapi.azureedge.net/api"
+            
+            # First get the list of available indicators
+            indicators_url = f"{base_url}/Indicator"
+            response = requests.get(indicators_url)
+            response.raise_for_status()
+            
+            # Search for musculoskeletal and sports injury related indicators
+            search_terms = [
+                "musculoskeletal",
+                "sports injury",
+                "joint pain",
+                "back pain",
+                "tendonitis",
+                "fracture",
+                "sprain",
+                "dislocation"
+            ]
+            
+            collected_data = []
+            
+            # Get all indicators first
+            all_indicators = response.json().get('value', [])
+            
+            # Filter for relevant indicators
+            relevant_indicators = []
+            for indicator in all_indicators:
+                indicator_name = indicator.get('IndicatorName', '').lower()
+                if any(term in indicator_name for term in search_terms):
+                    relevant_indicators.append(indicator)
+            
+            logger.info(f"Found {len(relevant_indicators)} relevant indicators")
+            
+            # Collect data for each relevant indicator
+            for indicator in relevant_indicators:
+                try:
+                    indicator_code = indicator.get('IndicatorCode')
+                    if not indicator_code:
+                        continue
+                        
+                    # Get data for this indicator
+                    data_url = f"{base_url}/{indicator_code}"
+                    response = requests.get(data_url)
+                    response.raise_for_status()
+                    
+                    data = response.json()
+                    if data and "value" in data:
+                        for item in data["value"]:
+                            # Skip if value is missing or zero
+                            if not item.get('NumericValue'):
+                                continue
+                                
+                            # Calculate relevance score based on data quality
+                            relevance_score = 1.0
+                            if item.get('Dim1') == 'BTSX':  # Both sexes
+                                relevance_score *= 1.2
+                            if item.get('Dim2') == 'AGEALL':  # All ages
+                                relevance_score *= 1.2
+                            
+                            processed_item = {
+                                "title": f"WHO {indicator.get('IndicatorName')} Data",
+                                "content": f"Indicator: {indicator.get('IndicatorName')}\n" + 
+                                         f"Country: {item.get('SpatialDim', 'N/A')}\n" +
+                                         f"Year: {item.get('TimeDim', 'N/A')}\n" +
+                                         f"Value: {item.get('NumericValue', 'N/A')}\n" +
+                                         f"Unit: {item.get('Unit', 'N/A')}",
+                                "source": "WHO GHO",
+                                "category": "injuries",
+                                "type": "statistics",
+                                "reliability": "high",
+                                "metadata": {
+                                    "indicator": indicator.get('IndicatorName'),
+                                    "indicator_code": indicator_code,
+                                    "country": item.get('SpatialDim'),
+                                    "year": item.get('TimeDim'),
+                                    "value": item.get('NumericValue'),
+                                    "unit": item.get('Unit'),
+                                    "dimensions": {k: v for k, v in item.items() if k.startswith('Dim')},
+                                    "relevance_score": relevance_score
+                                }
+                            }
+                            collected_data.append(processed_item)
+                    
+                    # Add delay to avoid rate limiting
+                    time.sleep(1)
+                    
+                except Exception as e:
+                    logger.error(f"Error collecting WHO data for indicator {indicator.get('IndicatorName')}: {str(e)}")
+                    continue
+            
+            # Sort by relevance score
+            collected_data.sort(key=lambda x: x['metadata']['relevance_score'], reverse=True)
+            
+            return {
+                "metadata": {
+                    "source": "WHO GHO",
+                    "collection_date": datetime.now().isoformat(),
+                    "total_indicators": len(relevant_indicators),
+                    "total_records": len(collected_data)
+                },
+                "data": collected_data
+            }
+            
+        except Exception as e:
+            logger.error(f"Error collecting WHO data: {str(e)}")
+            return {"metadata": {}, "data": []}
+
+    def _collect_openfda_data(self) -> Dict:
+        """Collect injury data from OpenFDA API"""
+        try:
+            # Base URL for OpenFDA API
+            base_url = "https://api.fda.gov/drug/event.json"
+            
+            # Search terms for sports and fitness related injuries
+            search_terms = [
+                "musculoskeletal",
+                "sports injury",
+                "joint pain",
+                "back pain",
+                "tendonitis",
+                "fracture",
+                "sprain",
+                "dislocation",
+                "muscle strain",
+                "ligament tear"
+            ]
+            
+            collected_data = []
+            
+            # Collect data for each search term
+            for term in search_terms:
+                try:
+                    # Construct the search query - using the correct format
+                    search_query = f"patient.reaction.reactionmeddrapt:(\"{term}\")"
+                    
+                    # Make the API request with count=1 first to test the query
+                    test_params = {
+                        'api_key': os.getenv('OPENFDA_API_KEY'),
+                        'search': search_query,
+                        'count': 'reactionmeddrapt'
+                    }
+                    
+                    test_response = requests.get(base_url, params=test_params)
+                    test_response.raise_for_status()
+                    
+                    # If test succeeds, get the full data
+                    params = {
+                        'api_key': os.getenv('OPENFDA_API_KEY'),
+                        'search': search_query,
+                        'limit': 100,
+                        'sort': 'reportdate:desc'
+                    }
+                    
+                    response = requests.get(base_url, params=params)
+                    response.raise_for_status()
+                    
+                    data = response.json()
+                    if data and 'results' in data:
+                        for result in data['results']:
+                            # Extract relevant information
+                            reactions = result.get('patient', {}).get('reaction', [])
+                            drugs = result.get('patient', {}).get('drug', [])
+                            
+                            # Process each reaction
+                            for reaction in reactions:
+                                reaction_pt = reaction.get('reactionmeddrapt', '')
+                                if not reaction_pt:
+                                    continue
+                                    
+                                # Create a structured item
+                                processed_item = {
+                                    "title": f"OpenFDA {reaction_pt} Report",
+                                    "content": f"Reaction: {reaction_pt}\n" +
+                                             f"Drugs: {', '.join(d.get('medicinalproduct', '') for d in drugs if d.get('medicinalproduct'))}\n" +
+                                             f"Report Date: {result.get('reportdate', 'N/A')}\n" +
+                                             f"Serious: {result.get('serious', 'N/A')}\n" +
+                                             f"Outcome: {', '.join(reaction.get('reactionoutcome', []))}",
+                                    "source": "OpenFDA",
+                                    "category": "injuries",
+                                    "type": "adverse_event",
+                                    "reliability": "high",
+                                    "metadata": {
+                                        "reaction": reaction_pt,
+                                        "drugs": [d.get('medicinalproduct', '') for d in drugs if d.get('medicinalproduct')],
+                                        "report_date": result.get('reportdate'),
+                                        "serious": result.get('serious'),
+                                        "outcome": reaction.get('reactionoutcome', []),
+                                        "search_term": term
+                                    }
+                                }
+                                collected_data.append(processed_item)
+                    
+                    # Add delay to avoid rate limiting
+                    time.sleep(1)
+                    
+                except Exception as e:
+                    logger.error(f"Error collecting OpenFDA data for term {term}: {str(e)}")
+                    continue
+            
+            return {
+                "metadata": {
+                    "source": "OpenFDA",
+                    "collection_date": datetime.now().isoformat(),
+                    "search_terms": search_terms,
+                    "total_records": len(collected_data)
+                },
+                "data": collected_data
+            }
+            
+        except Exception as e:
+            logger.error(f"Error collecting OpenFDA data: {str(e)}")
+            return {"metadata": {}, "data": []}
+
+    def _collect_pubmed_data(self) -> Dict:
+        """Collect injury data from PubMed API"""
+        try:
+            # Base URL for PubMed E-utilities
+            base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+            
+            # Search terms for sports and fitness related injuries
+            search_terms = [
+                "musculoskeletal injury",
+                "sports injury",
+                "joint pain",
+                "back pain",
+                "tendonitis",
+                "fracture",
+                "sprain",
+                "dislocation",
+                "muscle strain",
+                "ligament tear"
+            ]
+            
+            collected_data = []
+            
+            # Collect data for each search term
+            for term in search_terms:
+                try:
+                    # First, search for articles
+                    search_url = f"{base_url}/esearch.fcgi"
+                    search_params = {
+                        'db': 'pubmed',
+                        'term': f"{term}[Title/Abstract] AND (sports[Title/Abstract] OR exercise[Title/Abstract] OR fitness[Title/Abstract])",
+                        'retmax': 100,
+                        'retmode': 'json',
+                        'sort': 'date',
+                        'tool': 'fitness_app',
+                        'email': os.getenv('PUBMED_EMAIL', 'your.email@example.com')
+                    }
+                    
+                    response = requests.get(search_url, params=search_params)
+                    response.raise_for_status()
+                    
+                    search_data = response.json()
+                    if not search_data or 'esearchresult' not in search_data:
+                        continue
+                        
+                    # Get article IDs
+                    article_ids = search_data['esearchresult'].get('idlist', [])
+                    
+                    # Fetch details for each article
+                    for article_id in article_ids:
+                        try:
+                            # Get article details
+                            fetch_url = f"{base_url}/efetch.fcgi"
+                            fetch_params = {
+                                'db': 'pubmed',
+                                'id': article_id,
+                                'retmode': 'xml',
+                                'tool': 'fitness_app',
+                                'email': os.getenv('PUBMED_EMAIL', 'your.email@example.com')
+                            }
+                            
+                            response = requests.get(fetch_url, params=fetch_params)
+                            response.raise_for_status()
+                            
+                            # Parse XML response
+                            soup = BeautifulSoup(response.text, 'xml')
+                            article = soup.find('PubmedArticle')
+                            
+                            if article:
+                                # Extract article details
+                                title = article.find('ArticleTitle').text if article.find('ArticleTitle') else ''
+                                abstract = article.find('AbstractText').text if article.find('AbstractText') else ''
+                                authors = [author.find('LastName').text + ' ' + author.find('ForeName').text 
+                                         for author in article.find_all('Author') 
+                                         if author.find('LastName') and author.find('ForeName')]
+                                journal = article.find('Journal').find('Title').text if article.find('Journal') else ''
+                                pub_date = article.find('PubDate')
+                                year = pub_date.find('Year').text if pub_date and pub_date.find('Year') else ''
+                                
+                                if title and abstract:
+                                    processed_item = {
+                                        "title": title,
+                                        "content": f"Title: {title}\n\nAbstract: {abstract}",
+                                        "source": "PubMed",
+                                        "category": "injuries",
+                                        "type": "research_article",
+                                        "reliability": "high",
+                                        "metadata": {
+                                            "authors": authors,
+                                            "journal": journal,
+                                            "year": year,
+                                            "pmid": article_id,
+                                            "search_term": term
+                                        }
+                                    }
+                                    collected_data.append(processed_item)
+                            
+                            # Add delay to avoid rate limiting
+                            time.sleep(1)
+                            
+                        except Exception as e:
+                            logger.error(f"Error processing PubMed article {article_id}: {str(e)}")
+                            continue
+                    
+                    # Add delay between search terms
+                    time.sleep(2)
+                    
+                except Exception as e:
+                    logger.error(f"Error collecting PubMed data for term {term}: {str(e)}")
+                    continue
+            
+            return {
+                "metadata": {
+                    "source": "PubMed",
+                    "collection_date": datetime.now().isoformat(),
+                    "search_terms": search_terms,
+                    "total_records": len(collected_data)
+                },
+                "data": collected_data
+            }
+            
+        except Exception as e:
+            logger.error(f"Error collecting PubMed data: {str(e)}")
+            return {"metadata": {}, "data": []}
+
+    def _collect_pubmed_recovery_data(self) -> Dict:
+        """Collect recovery and rehabilitation data from PubMed"""
+        try:
+            # Base URL for PubMed E-utilities
+            base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+            
+            # Search terms for recovery and rehabilitation
+            search_terms = [
+                "sports injury recovery",
+                "musculoskeletal rehabilitation",
+                "injury rehabilitation",
+                "physical therapy",
+                "recovery protocol",
+                "rehabilitation program",
+                "sports medicine recovery",
+                "injury treatment protocol",
+                "recovery exercises",
+                "rehabilitation exercises"
+            ]
+            
+            collected_data = []
+            
+            # Collect data for each search term
+            for term in search_terms:
+                try:
+                    # First, search for articles
+                    search_url = f"{base_url}/esearch.fcgi"
+                    search_params = {
+                        'db': 'pubmed',
+                        'term': f"{term}[Title/Abstract] AND (sports[Title/Abstract] OR exercise[Title/Abstract] OR fitness[Title/Abstract])",
+                        'retmax': 100,
+                        'retmode': 'json',
+                        'sort': 'date',
+                        'tool': 'fitness_app',
+                        'email': os.getenv('PUBMED_EMAIL', 'your.email@example.com')
+                    }
+                    
+                    response = requests.get(search_url, params=search_params)
+                    response.raise_for_status()
+                    
+                    search_data = response.json()
+                    if not search_data or 'esearchresult' not in search_data:
+                        continue
+                        
+                    # Get article IDs
+                    article_ids = search_data['esearchresult'].get('idlist', [])
+                    
+                    # Fetch details for each article
+                    for article_id in article_ids:
+                        try:
+                            # Get article details
+                            fetch_url = f"{base_url}/efetch.fcgi"
+                            fetch_params = {
+                                'db': 'pubmed',
+                                'id': article_id,
+                                'retmode': 'xml',
+                                'tool': 'fitness_app',
+                                'email': os.getenv('PUBMED_EMAIL', 'your.email@example.com')
+                            }
+                            
+                            response = requests.get(fetch_url, params=fetch_params)
+                            response.raise_for_status()
+                            
+                            # Parse XML response
+                            soup = BeautifulSoup(response.text, 'xml')
+                            article = soup.find('PubmedArticle')
+                            
+                            if article:
+                                # Extract article details
+                                title = article.find('ArticleTitle').text if article.find('ArticleTitle') else ''
+                                abstract = article.find('AbstractText').text if article.find('AbstractText') else ''
+                                authors = [author.find('LastName').text + ' ' + author.find('ForeName').text 
+                                         for author in article.find_all('Author') 
+                                         if author.find('LastName') and author.find('ForeName')]
+                                journal = article.find('Journal').find('Title').text if article.find('Journal') else ''
+                                pub_date = article.find('PubDate')
+                                year = pub_date.find('Year').text if pub_date and pub_date.find('Year') else ''
+                                
+                                if title and abstract:
+                                    processed_item = {
+                                        "title": title,
+                                        "content": f"Title: {title}\n\nAbstract: {abstract}",
+                                        "source": "PubMed",
+                                        "category": "recovery",
+                                        "type": "research_article",
+                                        "reliability": "high",
+                                        "metadata": {
+                                            "authors": authors,
+                                            "journal": journal,
+                                            "year": year,
+                                            "pmid": article_id,
+                                            "search_term": term
+                                        }
+                                    }
+                                    collected_data.append(processed_item)
+                            
+                            # Add delay to avoid rate limiting
+                            time.sleep(1)
+                            
+                        except Exception as e:
+                            logger.error(f"Error processing PubMed article {article_id}: {str(e)}")
+                            continue
+                    
+                    # Add delay between search terms
+                    time.sleep(2)
+                    
+                except Exception as e:
+                    logger.error(f"Error collecting PubMed data for term {term}: {str(e)}")
+                    continue
+            
+            return {
+                "metadata": {
+                    "source": "PubMed",
+                    "collection_date": datetime.now().isoformat(),
+                    "search_terms": search_terms,
+                    "total_records": len(collected_data)
+                },
+                "data": collected_data
+            }
+            
+        except Exception as e:
+            logger.error(f"Error collecting PubMed recovery data: {str(e)}")
+            return {"metadata": {}, "data": []}
+
+def main():
+    # Example: Collect only injury and recovery data with force refresh
+    collector = FitnessDataCollector(collect_types=['injuries', 'recovery'], force_refresh=True)
+    collector.collect_data()
+
 if __name__ == "__main__":
-    # Create data directory structure
-    data_dir = Path("fitness_app/data")
-    data_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Initialize collector
-    collector = FitnessDataCollector()
-    
-    # Collect data for each category
-    categories = ["exercises", "nutrition", "injuries", "recovery", "fitness_knowledge"]
-    for category in categories:
-        print(f"\nCollecting {category} data...")
-        collector.collect_category_data(category)
-    
-    # Log final summary
-    collector.log_collection_summary() 
+    main() 

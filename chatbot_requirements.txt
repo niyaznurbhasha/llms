@@ -1,0 +1,57 @@
+# Core AI/ML Libraries
+torch>=2.0.0
+transformers>=4.30.0
+accelerate>=0.20.0
+sentence-transformers>=2.2.0
+
+# Audio Processing
+sounddevice>=0.4.6
+soundfile>=0.12.1
+torchaudio>=2.0.0
+webrtcvad>=2.0.10
+whisper-openai>=20231117
+
+# Speech Recognition and Processing
+speechbrain>=0.5.15
+
+# Data Processing
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Database and Storage
+sqlite3  # Built-in with Python
+
+# Utilities
+pathlib  # Built-in with Python
+datetime  # Built-in with Python
+json  # Built-in with Python
+logging  # Built-in with Python
+threading  # Built-in with Python
+queue  # Built-in with Python
+tempfile  # Built-in with Python
+hashlib  # Built-in with Python
+collections  # Built-in with Python
+typing  # Built-in with Python
+functools  # Built-in with Python
+concurrent.futures  # Built-in with Python
+gc  # Built-in with Python
+re  # Built-in with Python
+io  # Built-in with Python
+
+# Optional: For RAG functionality (if using topic_llm)
+# chromadb>=0.4.0
+# faiss-cpu>=1.7.4
+
+# Development and Testing
+pytest>=7.0.0
+black>=23.0.0
+flake8>=6.0.0
+
+# System-specific (Windows)
+# pywin32>=306  # Only on Windows
+
+# System-specific (Linux)
+# portaudio19-dev  # Only on Linux (install via package manager)
+
+# System-specific (macOS)
+# portaudio  # Only on macOS (install via brew) 
