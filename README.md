@@ -1,7 +1,7 @@
 # LLMs Repository
 
 This repository contains various tools and applications for working with Large Language Models (LLMs), focusing on fitness, transcription, and general LLM interactions.
-# Check out the chatbot readme for new chatbot functionalities!
+## Check out the chatbot readme for chatbot functionalities
 
 ## Projects
 
